@@ -6,6 +6,8 @@ from theforce.util.aseutil import init_velocities
 from ase.build import bulk
 from ase.md.npt import NPT
 from ase import units
+from ase.calculators.vasp import Vasp
+from ase.calculators.emt import EMT
 
 process_group = mpi_init()
 common = dict(ediff=0.01, fdiff=0.01, process_group=process_group)
