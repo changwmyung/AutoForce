@@ -670,7 +670,9 @@ class AtomsData:
 
     @property
     def target_energy(self):
-        return torch.tensor([atoms.target_energy for atoms in self])
+        #return torch.tensor([atoms.target_energy for atoms in self])
+        #cwm need to make multi option here
+        return torch.cat([atoms.target_energy for atoms in self])
 
     @property
     def target_forces(self):

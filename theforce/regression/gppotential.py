@@ -203,16 +203,29 @@ class AutoMean:
         for z in self._weights.keys():
             if z not in self.weights:
                 self.weights[z] = torch.tensor(0.)
+    def __call__(self, atoms, forces=False, multi=False, num_multi=1):
 
-    def __call__(self, atoms, forces=False):
-        e = torch.zeros([])
-        for z, count in atoms.counts().items():
-            if z in self.weights:
-                e += count*(self.weights[z]+self._weights[z])
-        if forces:
-            return e, torch.zeros(len(atoms), 3)
-        else:
-            return e
+        #cwm 
+        if multi is True: 
+            print(f'AutoMean {multi}, {num_multi}',flush=True)
+            e = torch.zeros((num_multi))
+            #cwm don't know what it does
+            for z, count in atoms.counts().items():
+                if z in self.weights:
+                    e += count*(self.weights[z]+self._weights[z])
+            if forces:
+                return e, torch.zeros(num_multi*len(atoms), 3)
+            else:
+                return e
+        else: 
+            e = torch.zeros([])
+            for z, count in atoms.counts().items():
+                if z in self.weights:
+                    e += count*(self.weights[z]+self._weights[z])
+            if forces:
+                return e, torch.zeros(len(atoms), 3)
+            else:
+                return e
 
     def __repr__(self):
         w = {z: float(self.weights[z]+self._weights[z])
@@ -222,8 +235,12 @@ class AutoMean:
 
 class GaussianProcessPotential(Module):
 
-    def __init__(self, kernels, noise=White(signal=0.01, requires_grad=True), parametric=None):
+    #cwm
+    def __init__(self, kernels, noise=White(signal=0.01, requires_grad=True), parametric=None, multi=False, num_multi=1):
         super().__init__()
+        #cwm
+        self.multi = multi
+        self.num_multi = num_multi
         self.kern = EnergyForceKernel(kernels)
         self.noise = noise
         self.parametric = parametric or AutoMean()
@@ -294,7 +311,8 @@ class GaussianProcessPotential(Module):
             else:
                 return 0
         else:
-            e = [self.parametric(sys, forces=forces) for sys in iterable(data)]
+            e = [self.parametric(sys, forces=forces, multi=self.multi, num_multi=self.num_multi) for sys in iterable(data)]
+            print(f'mean energy: {e}',flush=True)
             if forces:
                 e, f = zip(*e)
                 e = torch.cat([_e.view(-1) for _e in e])
@@ -307,8 +325,12 @@ class GaussianProcessPotential(Module):
                 return torch.cat([_e.view(-1) for _e in e])
 
     def Y(self, data):
-        y = torch.cat([torch.tensor([sys.target_energy for sys in data])] +
-                      [sys.target_forces.view(-1) for sys in data])
+        if self.multi is True: 
+            y = torch.cat([torch.cat([sys.target_energy for sys in data])] +
+                          [sys.target_forces.view(-1) for sys in data])
+        else:
+            y = torch.cat([torch.tensor([sys.target_energy for sys in data])] +
+                          [sys.target_forces.view(-1) for sys in data])
         return y - self.mean(data)
 
     def loss(self, data, Y=None, inducing=None, logprob_loss=True, cov_loss=False):
@@ -404,17 +426,22 @@ def context_setting(method):
 
     return wrapper
 
-
+#cwm includes multi option
 class PosteriorPotential(Module):
 
-    def __init__(self, gp, data=None, inducing=None, group=None, **setting):
+    def __init__(self, gp, data=None, inducing=None, group=None, multi=False, num_multi=1, **setting):
         super().__init__()
+        #cwm
+        self.multi = multi
+        self.num_multi = num_multi
+
         if type(gp) == GaussianProcessPotential:
             self.gp = gp
         elif type(gp) == list:
             self.gp = GaussianProcessPotential(gp)
         elif issubclass(gp.__class__, SimilarityKernel):
-            self.gp = GaussianProcessPotential([gp])
+            #cwm
+            self.gp = GaussianProcessPotential([gp],multi=self.multi,num_multi=self.num_multi)
         else:
             raise RuntimeError(f'type {type(gp)} is not recognized')
         if group is not None:
@@ -422,6 +449,7 @@ class PosteriorPotential(Module):
         else:
             self.is_distributed = False
         self.ignore_forces = False
+
         if data is not None:
             self.set_data(data, inducing=inducing, **setting)
         else:
@@ -431,6 +459,9 @@ class PosteriorPotential(Module):
             self.M = torch.empty(0, 0)
             self.Ke = torch.empty(0, 0)
             self.Kf = torch.empty(0, 0)
+            #cwm
+            if self.multi is True: 
+                self.m_L = torch.eye(self.num_multi,self.num_multi,requires_grad=True)
 
     @property
     def ndata(self):
@@ -452,10 +483,18 @@ class PosteriorPotential(Module):
             X = inducing.subset(self.gp.species)
             self.Ke = self.gp.kern(data, X, cov='energy_energy')
             self.Kf = self.gp.kern(data, X, cov='forces_energy')
+            #cwm
+            if self.multi is True: 
+                self.Ke = torch.kron(self.m_L.T@self.m_L, self.Ke) 
+                self.Kf = torch.kron(self.m_L.T@self.m_L, self.Kf) 
+
             if data.is_distributed:
                 distrib.all_reduce(self.Ke)
                 distrib.all_reduce(self.Kf)
             self.M = self.gp.kern(X, X, cov='energy_energy')
+            #cwm
+            if self.multi is True: 
+                self.M = torch.kron(self.m_L.T@self.m_L, self.M) 
             self.X = X
             self.make_munu()
             self.has_target_forces = False
@@ -574,11 +613,14 @@ class PosteriorPotential(Module):
         #
         # predictive variance for x
         # _vscale *[ k(x,x) - k(x,m)k(m,m)^{-1}k(m,x) ]
-        self.indu_numbers = torch.tensor([x.number for x in self.X])
+        
+        #cwm
+        self.indu_numbers = torch.tensor(self.num_multi*[x.number for x in self.X])
         self._vscale = {}
         mu = self.mu*(self.M@self.mu)
         for z in self.indu_counts.keys():
             I = self.indu_numbers == z
+            print(f'stat: {z}, {self.indu_numbers}, {I}, {I.sum()}',flush=True)
             self._vscale[z] = mu[I].sum()/I.sum()
 
     @property
@@ -671,11 +713,18 @@ class PosteriorPotential(Module):
         if remake:
             self.make_munu()
 
+    #cwm
     @context_setting
     def add_inducing(self, X, col=None, remake=True):
         assert X.number in self.gp.species
-        Ke = self.gp.kern(self.data, X, cov='energy_energy')
-        Kf = self.gp.kern(self.data, X, cov='forces_energy')
+        if self.multi is True:
+            Ke = self.gp.kern(self.data, X, cov='energy_energy') 
+            Ke = torch.kron(self.m_L.T@self.m_L, Ke) 
+            Kf = self.gp.kern(self.data, X, cov='forces_energy')
+            Kf = torch.kron(self.m_L.T@self.m_L, Kf) 
+        else:
+            Ke = self.gp.kern(self.data, X, cov='energy_energy')
+            Kf = self.gp.kern(self.data, X, cov='forces_energy')
         if self.data.is_distributed:
             distrib.all_reduce(Ke)
             distrib.all_reduce(Kf)
@@ -686,10 +735,20 @@ class PosteriorPotential(Module):
             self.Ke = Ke
             self.Kf = Kf
         if col is None:
-            a = self.gp.kern(self.X, X, cov='energy_energy')
+            if self.multi is True:
+                a = self.gp.kern(self.X, X, cov='energy_energy')
+                a = torch.kron(self.m_L.T@self.m_L, a)
+            else:
+                a = self.gp.kern(self.X, X, cov='energy_energy')
         else:
             a = col
-        b = self.gp.kern(X, X, cov='energy_energy')
+
+        if self.multi is True:
+            b = self.gp.kern(X, X, cov='energy_energy')
+            b = torch.kron(self.m_L.T@self.m_L, b)
+        else:
+            b = self.gp.kern(X, X, cov='energy_energy')
+
         self.M = torch.cat(
             [torch.cat([self.M, a.t()]), torch.cat([a, b])], dim=1)
         self.X += X
@@ -1138,14 +1197,32 @@ def _regression(self, optimize=False, noise_f=None, max_noise=0.99, same_sigma=T
             scale[z] = self.M.diag()[numbers == z].mean() * max_noise
 
     #
-    L, ridge = jitcholesky(self.M)
-    self.ridge = torch.as_tensor(ridge)
-    self.choli = L.inverse().contiguous()
-    data = self.data
-    ndat = len(data)
-    energies = data.target_energy
-    forces = torch.cat([atoms.target_forces.view(-1) for atoms in data])
-    Y = torch.cat((forces, torch.zeros(L.size(0))))
+    #cwm 
+    if self.multi is True: 
+        print(f'yes multi {self.num_multi}',flush=True)
+        L, ridge = jitcholesky(self.M)
+        self.ridge = torch.as_tensor(ridge)
+        self.choli = L.inverse().contiguous()
+        data = self.data
+        ndat = len(data)
+        print(f'multi: {data.target_energy}')
+        #energies = torch.chunk(data.target_energy,self.num_multi)[0]
+        energies = data.target_energy
+        print(f'energies: {energies}')
+        #forces = torch.chunk(torch.cat([atoms.target_forces.view(-1) for atoms in data]),self.num_multi)[0] 
+        forces = torch.cat([atoms.target_forces.view(-1) for atoms in data])
+        print(f'forces: {forces.shape}')
+        Y = torch.cat((forces, torch.zeros(L.size(0))))
+    else:
+        print('no multi',flush=True)
+        L, ridge = jitcholesky(self.M)
+        self.ridge = torch.as_tensor(ridge)
+        self.choli = L.inverse().contiguous()
+        data = self.data
+        ndat = len(data)
+        energies = data.target_energy
+        forces = torch.cat([atoms.target_forces.view(-1) for atoms in data])
+        Y = torch.cat((forces, torch.zeros(L.size(0))))
 
     def make_mu(with_energies=None):
         if same_sigma:
