@@ -1,4 +1,3 @@
-# +
 from theforce.regression.gppotential import PosteriorPotential, PosteriorPotentialFromFolder
 from theforce.descriptor.atoms import TorchAtoms, AtomsData, LocalsData, Distributer
 from theforce.similarity.sesoap import SeSoapKernel, SubSeSoapKernel
@@ -92,7 +91,6 @@ class Switch:
                 break
         return self.values[k]
 
-
 class ActiveCalculator(Calculator):
     implemented_properties = ['energy', 'forces', 'stress', 'free_energy']
 
@@ -101,7 +99,10 @@ class ActiveCalculator(Calculator):
                  ediff=2*kcal_mol, ediff_lb=None, ediff_ub=None,
                  ediff_tot=4*kcal_mol, fdiff=3*kcal_mol, noise_f=kcal_mol, ioptim=1,
                  max_data=inf, max_inducing=inf, kernel_kw=None, veto=None, include_params=None,
-                 eps_dr=0.1, ignore=None, report_timings=False):
+                 eps_dr=0.1, ignore=None, report_timings=False,
+                 #cwm
+                 multi=False, multi_calculators=None
+                ):
         """
         inputs:
             covariance:      None | similarity kernel(s) | path to a pickled model | model
@@ -252,6 +253,22 @@ class ActiveCalculator(Calculator):
         include_params (deprecated in favor of veto):
             This applies some constraints for sampling data when include_data/-tape are called.
             e.g. {'fmax': 5.0}, etc.
+            
+        multi:
+            If set True, the active calculator utilizes the multilearning kernel. 
+            The current implementation is only limited to the linear coregional model
+            where the identical kernel is shared between the tasks. The intertask correlations
+            are learned via coregional matrix W=L.T@L which is a positive semi-definite matrix 
+            by definition. More informations is available: 
+        
+        multi_calculators:
+            The calculators are classed as (1) driver_calculator and (2) observe_calculator(s). 
+            A real dynamics is run by the driver_calculator while the rest of observe_calculators 
+            learn their own PESs. 
+
+        num_multi:
+            The number of multi calculators.
+            
         """
 
         Calculator.__init__(self)
@@ -259,6 +276,15 @@ class ActiveCalculator(Calculator):
         self.process_group = process_group
         self.distrib = Distributer(self.world_size)
         self.pckl = pckl
+        
+        #cwm
+        self.multi=multi
+        self.multi_calculators=multi_calculators if self.multi is True else None
+        if self.multi is True:
+            self.num_multi=len(self.multi_calculators) 
+        else:
+            self.num_multi=1
+
         self.get_model(covariance, kernel_kw or {})
         self.ediff = ediff
         self.ediff_lb = ediff_lb or ediff
@@ -318,7 +344,8 @@ class ActiveCalculator(Calculator):
         elif type(model) == PosteriorPotential:
             self.model = model
         else:
-            self.model = PosteriorPotential(model)
+            #cwm
+            self.model = PosteriorPotential(model,multi=self.multi,num_multi=self.num_multi)
 
     def get_ready(self):
         if not self._ready:
@@ -485,8 +512,15 @@ class ActiveCalculator(Calculator):
         return c1
 
     def update_results(self, retain_graph=False):
-        energies = self.cov@self.model.mu
-        energy = self.reduce(energies, retain_graph=retain_graph)
+        #cwm
+        if self.multi is True:
+            energies = torch.kron(self.model.m_L.T@self.model.m_L, self.cov)@self.model.mu
+            print(f'update_results:  {energies}',flush=True)
+            energy = self.reduce(energies.chunk(self.num_multi)[0], retain_graph=retain_graph)
+            print(f'update_results:  {energy} - {energies.shape}',flush=True)
+        else:
+            energies = self.cov@self.model.mu
+            energy = self.reduce(energies, retain_graph=retain_graph)
         # ... or
         # self.allcov = self.gather(self.cov)
         # energies = self.allcov@self.model.mu
@@ -641,7 +675,39 @@ class ActiveCalculator(Calculator):
                 dE, df.max(), df.mean()))
         self._last_test = self.step
         return energy, forces
-
+    
+    #cwm
+    #Calculate exact energy, forces of multiple calculators
+    def _exact_multi(self, copy):
+        tmp = copy.as_ase() if self.to_ase else copy
+        
+        multi_energy=np.empty((0,1))
+        multi_forces=np.empty((0,3))
+        for ic, m_calc in enumerate(self.multi_calculators): 
+            tmp.set_calculator(m_calc)
+            energy = tmp.get_potential_energy()
+            forces = tmp.get_forces()
+            
+            multi_energy=np.append(multi_energy,tmp.get_potential_energy())
+            multi_forces=np.append(multi_forces,tmp.get_forces(),axis=0)
+            
+            if self.tape:
+                # self.tape.write(tmp)
+                self._saved_for_tape = tmp
+            self.log('exact energy: {}'.format(energy))
+            
+            if self.model.ndata > 0:
+                dE = self.results['energy'] - energy
+                df = abs(self.results['forces'] - forces)
+                self.log(f'Multilearning method activated - calc {ic}')
+                self.log('errors (pre):  del-E: {:.2g}  max|del-F|: {:.2g}  mean|del-F|: {:.2g}'.format(
+                    dE, df.max(), df.mean()))
+            self._last_test = self.step
+            
+        self.log(f'multi energy: {multi_energy}')
+        
+        return multi_energy, multi_forces
+    
     def snapshot(self, fake=False, copy=None):
         if copy is None:
             copy = self.atoms.copy()
@@ -649,16 +715,25 @@ class ActiveCalculator(Calculator):
             energy = self.results['energy']
             forces = self.results['forces']
         else:
-            energy, forces = self._exact(copy)
+            #cwm
+            if self.multi is True:
+                energy, forces = self._exact_multi(copy)
+            else:
+                energy, forces = self._exact(copy)
         copy.set_calculator(SinglePointCalculator(copy, energy=energy,
                                                   forces=forces))
         copy.set_targets()
+        #print(f'snapshot energy: {copy.get_potential_energy()}',flush=True)
         return copy
 
     def head(self, energy_and_forces=None):
         added = self.model.data[-1]
         if energy_and_forces is None:
-            energy, forces = self._exact(added)
+            #cwm
+            if self.multi is True:
+                energy, forces = self._exact_multi(added)
+            else:
+                energy, forces = self._exact(added)
         added.calc.results['energy'] = energy
         added.calc.results['forces'] = forces
         added.set_targets()
@@ -683,13 +758,17 @@ class ActiveCalculator(Calculator):
             return x
 
     def get_covloss(self):
-        b = self.model.choli@self.cov.detach().t()
+        #cwm
+        #does not understand what it does
+        b = self.model.choli@torch.kron(self.model.m_L.T@self.model.m_L, self.cov).detach().t()
         c = (b*b).sum(dim=0)
         if not self.normalized:
             alpha = [self.model.gp.kern(x, x).detach()
                      for x in self.atoms]
             alpha.append(torch.zeros(0))
-            alpha = torch.cat(alpha).view(-1)
+            print(f'covloss: alpha:{len(alpha)}')
+            alpha = torch.cat(self.num_multi*alpha).view(-1)
+            print(f'covloss: c:{c.shape}, alpha:{alpha.shape}')
             c = c/alpha
             if self.normalized is None:
                 self.normalized = self.gather(alpha).allclose(torch.ones([]))
@@ -705,13 +784,17 @@ class ActiveCalculator(Calculator):
                 vscale.append(self.model._vscale[z])
             else:
                 vscale.append(float('inf'))
-        vscale = torch.tensor(vscale).sqrt()
+        vscale = torch.tensor(self.num_multi*vscale).sqrt()
         return beta*vscale
 
     def update_lce(self, loc, beta=None):
         k = None
         if beta is None:
-            k = self.model.gp.kern(loc, self.model.X)
+            #cwm
+            if self.multi is True: 
+                k = torch.kron(self.model.m_L.T@self.model.m_L, self.model.gp.kern(loc, self.model.X))
+            else: 
+                k = self.model.gp.kern(loc, self.model.X)
             b = self.model.choli@k.detach().t()
             c = (b*b).sum()  # /self.model.gp.kern(loc, loc)
             if loc.number in self.model._vscale:
@@ -1218,10 +1301,3 @@ def log_to_figure(file, figsize=(10, 5), window=(None, None), meta_ax=True, plot
         axes[3].plot(steps, dfmax, 'v:', color='cornflowerblue')
     fig.tight_layout()
     return fig
-
-
-if __name__ == '__main__':
-    import sys
-    log = sys.argv[1]
-    fig = log_to_figure(log)
-    fig.savefig(log.replace('.log', '.pdf'))
