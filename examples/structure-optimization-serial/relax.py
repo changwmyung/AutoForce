@@ -26,7 +26,8 @@ abinitio = EMT()
 active_kwargs = {'calculator': abinitio,
                  'ediff': 1.0*kcal_mol,  # decrease for more accuracy but lower speed
                  'fdiff': 1.0*kcal_mol,  # decrease for more accuracy but lower speed
-                 'kernel_kw': {'cutoff': 6., 'lmax': 3, 'nmax': 3},
+                 'kernel_kw': {'cutoff': 6., 'lmax': 3, 'nmax': 3}, 'multi': True,
+                 'multi_calculators': [EMT(),EMT()]
                  # 'kernel_kw': {'cutoff': 6., 'lmax': 3, 'nmax': 3, 'species': [79]}, # <- faster
                  # 'veto': {'forces': 8.}  # for vetoing ML updates for very high energy structures
                  }
